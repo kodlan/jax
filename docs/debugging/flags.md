@@ -15,7 +15,7 @@ kernelspec:
 (debugging-flags)=
 # JAX debugging flags
 
-<!--* freshness: { reviewed: '2025-10-28' } *-->
+<!--* freshness: { reviewed: '2026-07-23' } *-->
 
 JAX offers flags and context managers that enable catching errors more easily.
 
@@ -87,10 +87,90 @@ with jax.debug_nans(False):
 
 ## `jax_debug_infs` configuration option and context manager
 
-`jax_debug_infs` works similarly to `jax_debug_nans`. `jax_debug_infs` often needs to be combined with `jax_disable_jit`, since Infs might not cascade to the output like NaNs. Alternatively, `jax.experimental.checkify` may be used to find Infs in intermediates.
+**Summary:** Enable the `jax_debug_infs` flag to automatically detect when infinite values are produced in `jax.jit`-compiled code.
 
-Full documentation of `jax_debug_infs` is forthcoming.
-<!-- https://github.com/jax-ml/jax/issues/17722 -->
+`jax_debug_infs` is a JAX flag that works like `jax_debug_nans` (see above), but checks for infinite values instead of NaNs: when enabled, computations error-out immediately on production of an inf. Values produced outside of an `@jax.jit` are checked after every primitive operation, while for code under an `@jax.jit` only the output of each `@jax.jit` function is checked; if an inf is present the function is re-run in de-optimized op-by-op mode to more precisely identify the operation that produced it.
+
+Unlike NaNs, which propagate through most floating point operations, infs can disappear from later results (for example `1 / jnp.inf` is `0`). Since only the outputs of a `@jax.jit`-compiled function are checked, an inf produced in an intermediate value inside a jitted function can therefore go undetected. To catch such intermediates, either combine `jax_debug_infs` with `jax_disable_jit` so that every operation is checked individually, or add an explicit `jax.experimental.checkify` check on the intermediate value; both are shown in the examples below.
+
+### Usage
+
+If you want to trace where infs are occurring in your functions or gradients, you can turn on the inf-checker by doing one of:
+* running your code inside the `jax.debug_infs` context manager, using `with jax.debug_infs(True):`;
+* setting the `JAX_DEBUG_INFS=True` environment variable;
+* adding `jax.config.update("jax_debug_infs", True)` near the top of your main file;
+* adding `jax.config.parse_flags_with_absl()` to your main file, then set the option using a command-line flag like `--jax_debug_infs=True`;
+
+### Example(s)
+
+```{code-cell}
+import jax
+import jax.numpy as jnp
+import traceback
+jax.config.update("jax_debug_infs", True)
+
+def f(x):
+  return 1. / x
+
+# The stack trace is very long so only print a couple lines.
+try:
+  jax.jit(f)(jnp.array(0.))
+except FloatingPointError as e:
+  print(traceback.format_exc(limit=2))
+```
+
+The inf generated under the `@jax.jit` was caught: it appeared in the function's output, and the de-optimized re-run identified the `div` operation that produced it. (The log message printed before the re-run currently says "nan" even when the value is an inf.) As with `jax_debug_nans`, running `%debug` gives a post-mortem debugger.
+
+However, an inf that only appears in an intermediate value can escape detection, because infs are easily lost before reaching the output:
+
+```{code-cell}
+def g(x):
+  y = jnp.exp(x)   # overflows to inf for float32 x = 89.
+  return 1. / y    # 1 / inf = 0, so there is no inf in the output
+
+print(jax.jit(g)(jnp.float32(89.)))  # no error is raised
+```
+
+Combining the flag with `jax_disable_jit` disables compilation, so every operation is checked individually and the intermediate inf is caught at its source:
+
+```{code-cell}
+with jax.disable_jit():
+  try:
+    jax.jit(g)(jnp.float32(89.))
+  except FloatingPointError as e:
+    print(traceback.format_exc(limit=2))
+```
+
+Alternatively, {mod}`jax.experimental.checkify` (see the [checkify guide](checkify_guide)) can find infs in intermediates without disabling compilation, by adding an explicit check on the intermediate value (note that checkify's automatic `float_checks` detect NaNs and divisions by zero, but not infs produced by overflow):
+
+```{code-cell}
+from jax.experimental import checkify
+
+def g_checked(x):
+  y = jnp.exp(x)
+  checkify.check(jnp.all(jnp.isfinite(y)), "y is not finite!")
+  return 1. / y
+
+err, out = checkify.checkify(jax.jit(g_checked))(jnp.float32(89.))
+print(err.get())
+```
+
+Since we activated the flag above with `jax.config.update`, let's deactivate it again (for activating or deactivating it locally, use the `jax.debug_infs` context manager shown in the Usage section):
+
+```{code-cell}
+jax.config.update("jax_debug_infs", False)
+```
+
+#### Strengths and limitations of `jax_debug_infs`
+##### Strengths
+* Easy to apply
+* Precisely detects where infs were produced
+* Throws a standard Python exception and is compatible with PDB postmortem
+
+##### Limitations
+* Re-running functions eagerly can be slow. You shouldn't have the inf-checker on if you're not debugging, as it can introduce lots of device-host round-trips and performance regressions.
+* Errors on false positives (e.g. intentionally created infs)
+* For code under an `@jax.jit`, only the function outputs are checked, so infs in intermediate values can go undetected; combine with `jax_disable_jit` or use `checkify` as shown above
 
 ## `jax_disable_jit` configuration option and context manager
 
